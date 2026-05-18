@@ -79,7 +79,7 @@ uv run umi run-slam-pipeline umi_pipeline_configs/build_dataset.yaml \
 Upload the whole session directory to the Hugging Face Hub:
 
 ```bash
-hf upload ${HF_USER}/<repo_id> data/<demo_directory_name>/demos/mapping/object_poses.json
+hf upload ${HF_USER}/<repo_id> data/<demo_directory_name>/demos/mapping/object_poses.json --repo-type dataset
 ```
 
 # Data Creation in Simulator
