@@ -127,6 +127,7 @@ class CupStackingStateMachine(StateMachineBase):
         self._pink_retreat_target_w: torch.Tensor | None = None
         self._gripper_down_yaw_w: torch.Tensor | None = None
         self._gripper_down_yaw_offset_w: torch.Tensor | None = None
+        self._episode_base_yaw_w: torch.Tensor | None = None
         self._event: int = 0
         self._events_dt = [
             160,  # Phase 0: Move above the blue cup
@@ -289,6 +290,7 @@ class CupStackingStateMachine(StateMachineBase):
         self._pink_retreat_target_w = None
         self._gripper_down_yaw_w = None
         self._gripper_down_yaw_offset_w = None
+        self._episode_base_yaw_w = None
 
     # ------------------------------------------------------------------
     def _ee_pos_w(self, robot) -> torch.Tensor:
@@ -367,7 +369,13 @@ class CupStackingStateMachine(StateMachineBase):
         self, robot, num_envs: int, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
         if self._gripper_down_yaw_w is None or self._gripper_down_yaw_w.shape[0] != num_envs:
-            base_yaw = self._current_hand_heading_yaw_w(robot).to(device=device, dtype=dtype)
+            if (
+                self._episode_base_yaw_w is not None
+                and self._episode_base_yaw_w.shape[0] == num_envs
+            ):
+                base_yaw = self._episode_base_yaw_w.to(device=device, dtype=dtype)
+            else:
+                base_yaw = self._current_hand_heading_yaw_w(robot).to(device=device, dtype=dtype)
             self._gripper_down_yaw_offset_w = torch.empty(num_envs, device=device, dtype=dtype).uniform_(
                 _GRIPPER_DOWN_YAW_OFFSET_RANGE[0],
                 _GRIPPER_DOWN_YAW_OFFSET_RANGE[1],
@@ -378,6 +386,18 @@ class CupStackingStateMachine(StateMachineBase):
         pitch = torch.full((num_envs,), _GRIPPER_DOWN_PITCH_W, device=device, dtype=dtype)
         yaw = self._gripper_down_yaw_w.to(device=device, dtype=dtype)
         return quat_from_euler_xyz(roll, pitch, yaw)
+
+    def set_episode_base_yaw_from_object(self, env, object_name: str = _BLUE_CUP_NAME) -> None:
+        """Capture an object's world yaw and use it as base_yaw for this episode's grasp.
+
+        Cups are visually symmetric across 180°, so the yaw is folded into [-pi/2, pi/2]
+        to avoid gratuitous wrist flips when the JSON encodes a >90° rotation.
+        """
+        quat_w = env.scene[object_name].data.root_quat_w
+        w, x, y, z = quat_w[:, 0], quat_w[:, 1], quat_w[:, 2], quat_w[:, 3]
+        yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        yaw = ((yaw + math.pi / 2.0) % math.pi) - math.pi / 2.0
+        self._episode_base_yaw_w = yaw.clone()
 
     def _current_hand_heading_yaw_w(self, robot) -> torch.Tensor:
         quat_w = self._ee_quat_w(robot)
@@ -405,3 +425,7 @@ class CupStackingStateMachine(StateMachineBase):
     @property
     def step_count(self) -> int:
         return self._step_count
+
+    @property
+    def task_object_names(self) -> tuple[str, ...]:
+        return (_BLUE_CUP_NAME, _PINK_CUP_NAME)

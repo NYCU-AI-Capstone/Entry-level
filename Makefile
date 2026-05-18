@@ -2,6 +2,7 @@
 	submodules submodules-pull \
 	build-isaaclab launch-isaaclab \
 	launch-isaaclab-glowsai-4090 launch-isaaclab-glowsai-l40s \
+	install-isaaclab-native launch-isaaclab-native datagen-native \
 	check-isaaclab-gpu
 
 # ---- Config ------------------------------------------------------------------
@@ -177,6 +178,85 @@ launch-isaaclab-glowsai-l40s: build-isaaclab
 			cd /workspace/aicapstone; \
 			exec /bin/bash \
 		'
+
+# ---- Native install (no Docker; conda env on host) ---------------------------
+# Mirrors the Dockerfile pip sequence into a host conda env so the simulator
+# can run directly on machines where Docker isn't available.
+NATIVE_CONDA_ENV ?= isaaclab-native
+
+define activate_native_env
+eval "$$(conda shell.bash hook)" && conda activate $(NATIVE_CONDA_ENV)
+endef
+
+install-isaaclab-native: submodules
+	@set -e; \
+	if ! command -v conda >/dev/null; then \
+		echo "conda not found on PATH" >&2; exit 1; \
+	fi; \
+	eval "$$(conda shell.bash hook)"; \
+	if ! conda env list | awk '{print $$1}' | grep -qx "$(NATIVE_CONDA_ENV)"; then \
+		conda create -y -n $(NATIVE_CONDA_ENV) python=3.11; \
+	fi; \
+	conda activate $(NATIVE_CONDA_ENV); \
+	export ACCEPT_EULA=Y OMNI_KIT_ACCEPT_EULA=YES PRIVACY_CONSENT=Y; \
+	python -m pip install --upgrade pip; \
+	python -m pip install -U torch==2.7.0 torchvision==0.22.0 \
+		--index-url https://download.pytorch.org/whl/cu128; \
+	python -m pip install --upgrade "isaacsim[all,extscache]==5.1.0" \
+		--extra-index-url https://pypi.nvidia.com; \
+	python -m pip install pip==23 setuptools==65 flatdict==4.0.0 \
+		huggingface-hub==0.35.3 transformers==4.57.6; \
+	python -m pip install --no-deps setuptools==65 wheel==0.45.1 toml==0.10.2 \
+		packaging==23.0 poetry-core==2.2.1; \
+	sed -i 's|-m pip install"|-m pip install --no-build-isolation"|' \
+		dependencies/IsaacLab/isaaclab.sh; \
+	(cd dependencies/IsaacLab && ./isaaclab.sh --install); \
+	python -m pip install --no-deps numpy==1.26.0; \
+	python -m pip install --upgrade setuptools==80.10.2 wheel==0.45.1 \
+		cython==3.0.11 toml==0.10.2 packaging==24.2; \
+	printf "numpy==1.26.0\n" > /tmp/sim-constraints.txt; \
+	python -m pip install --use-deprecated=legacy-resolver --no-build-isolation \
+		-c /tmp/sim-constraints.txt -e packages/simulator; \
+	python -m pip install --no-deps numpy==1.26.0; \
+	rm -f /tmp/sim-constraints.txt; \
+	python -m pip install --upgrade pip==26.0.1; \
+	python -m pip install --no-deps numpy==1.26.0; \
+	echo; \
+	echo "Native install complete. Activate via: conda activate $(NATIVE_CONDA_ENV)"
+
+# ---- Native headless shell (no Docker, no display) ---------------------------
+launch-isaaclab-native:
+	@set -e; \
+	$(activate_native_env); \
+	unset DISPLAY; \
+	export OMNI_KIT_ACCEPT_EULA=Y PRIVACY_CONSENT=Y; \
+	export NVIDIA_DRIVER_CAPABILITIES=graphics,display,utility,compute; \
+	$(select_vulkan_icd); \
+	echo "== GPU check =="; nvidia-smi -L; \
+	echo; \
+	echo "Env: $(NATIVE_CONDA_ENV) (headless, no DISPLAY)"; \
+	echo "Run datagen via:"; \
+	echo "  python scripts/datagen/generate.py --task <TASK> --num_envs 1 \\"; \
+	echo "      --device cuda --headless --enable_cameras --record \\"; \
+	echo "      --use_lerobot_recorder --lerobot_dataset_repo_id \$$HF_USER/<repo> \\"; \
+	echo "      --object_poses data/<demo>/object_poses.json"; \
+	exec /bin/bash
+
+# ---- Native datagen (no Docker, no display) ----------------------------------
+# Forward extra args via DATAGEN_ARGS=, e.g.:
+#   make datagen-native DATAGEN_ARGS='--task HCIS-CupStacking-SingleArm-v0 \
+#       --num_envs 1 --device cuda --record --use_lerobot_recorder \
+#       --lerobot_dataset_repo_id $$HF_USER/cup-stacking-sim-v0 \
+#       --object_poses data/kitchen-object-poses/object_poses.json'
+DATAGEN_ARGS ?=
+datagen-native:
+	@set -e; \
+	$(activate_native_env); \
+	unset DISPLAY; \
+	export ACCEPT_EULA=Y OMNI_KIT_ACCEPT_EULA=YES PRIVACY_CONSENT=Y; \
+	export NVIDIA_DRIVER_CAPABILITIES=graphics,display,utility,compute; \
+	$(select_vulkan_icd); \
+	python scripts/datagen/generate.py --headless --enable_cameras $(DATAGEN_ARGS)
 
 # ---- GPU sanity check --------------------------------------------------------
 check-isaaclab-gpu:

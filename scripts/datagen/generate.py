@@ -47,6 +47,12 @@ parser.add_argument("--quality", action="store_true", help="Whether to enable qu
 parser.add_argument("--use_lerobot_recorder", action="store_true", help="Whether to use lerobot recorder.")
 parser.add_argument("--lerobot_dataset_repo_id", type=str, default=None, help="Lerobot Dataset repository ID.")
 parser.add_argument("--lerobot_dataset_fps", type=int, default=30, help="Lerobot Dataset frames per second.")
+parser.add_argument(
+    "--max_retries",
+    type=int,
+    default=2,
+    help="On episode failure, retry the same object_poses entry up to N times with small pose jitter before advancing.",
+)
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -183,12 +189,21 @@ def _replace_recorder_manager(env, env_cfg, args_cli):
         env.recorder_manager.compression = "lzf"
 
 
-def _apply_episode_poses(env, poses):
-    """Write per-object root poses for the current episode into the sim."""
+def _apply_episode_poses(env, poses, jitter_xy: float = 0.0):
+    """Write per-object root poses for the current episode into the sim.
+
+    ``jitter_xy`` (in meters) adds uniform per-object x/y noise — used on retries to
+    nudge the scene out of a bad configuration the scripted policy can't recover from.
+    """
     import math as _math
+    import random as _random
 
     device = env.device
     for name, (pos, quat) in poses.items():
+        if jitter_xy > 0.0:
+            dx = _random.uniform(-jitter_xy, jitter_xy)
+            dy = _random.uniform(-jitter_xy, jitter_xy)
+            pos = (pos[0] + dx, pos[1] + dy, pos[2])
         obj = env.scene[name]
         pose_tensor = torch.tensor(
             [[pos[0], pos[1], pos[2], quat[0], quat[1], quat[2], quat[3]]],
@@ -221,22 +236,38 @@ def _any_object_fell(env, object_names, z_threshold: float) -> bool:
     return False
 
 
+def _stage_episode(env, sm, pose, jitter_xy: float = 0.0):
+    """Reset env+SM, write the chosen object poses, capture per-cup base yaw.
+
+    Wraps the common "begin a fresh episode" sequence used at startup, on advance,
+    and on retry. ``pose`` is one entry from ``load_episode_poses``.
+    """
+    env.reset()
+    sm.reset()
+    auto_terminate(env, False)
+    _apply_episode_poses(env, pose, jitter_xy=jitter_xy)
+    # write_root_pose_to_sim defers visibility until the scene is updated; step the
+    # scene so root_quat_w reflects the new pose before reading it.
+    env.scene.update(dt=env.physics_dt)
+    if hasattr(sm, "set_episode_base_yaw_from_object"):
+        sm.set_episode_base_yaw_from_object(env, "blue_cup")
+
+
 def _on_episode_done(
     env,
     sm,
     args_cli,
-    episodes,
-    next_episode_idx,
     resume_recorded_demo_count,
     current_recorded_demo_count,
     start_record_state,
 ):
-    """Handle end-of-episode logic.
+    """Decide the outcome of the just-finished episode.
 
-    Returns (next_episode_idx, current_recorded_demo_count, start_record_state, should_break).
+    Does NOT advance the episode index or reset the env — the main loop owns that
+    so it can implement retry-on-failure.
+
+    Returns (success, current_recorded_demo_count, start_record_state).
     """
-    total_episodes = len(episodes)
-
     try:
         success = sm.check_success(env)
     except Exception as e:
@@ -266,17 +297,7 @@ def _on_episode_done(
         )
         print(f"Recorded {current_recorded_demo_count} successful demonstrations.")
 
-    if next_episode_idx >= total_episodes:
-        print(f"Replayed all {total_episodes} episodes. Exiting the app.")
-        return next_episode_idx, current_recorded_demo_count, start_record_state, True, success
-
-    env.reset()
-    sm.reset()
-    auto_terminate(env, False)
-    _apply_episode_poses(env, episodes[next_episode_idx])
-    next_episode_idx += 1
-
-    return next_episode_idx, current_recorded_demo_count, start_record_state, False, success
+    return success, current_recorded_demo_count, start_record_state
 
 
 def main():
@@ -351,7 +372,7 @@ def main():
         env.close()
         simulation_app.close()
         return
-    _apply_episode_poses(env, episodes[next_episode_idx])
+    _stage_episode(env, sm, episodes[next_episode_idx])
     next_episode_idx += 1
 
     start_record_state = False
@@ -364,8 +385,10 @@ def main():
         print("\n[INFO] KeyboardInterrupt (Ctrl+C) detected. Cleaning up resources...")
 
     original_sigint_handler = signal.signal(signal.SIGINT, signal_handler)
-    cnt = 1
-    success_ID = []
+    attempt_count = 0
+    success_count = 0
+    retry_count = 0
+    success_ID: list[int] = []
     try:
         while simulation_app.is_running() and not simulation_app.is_exiting() and not interrupted:
             with torch.inference_mode():
@@ -373,30 +396,56 @@ def main():
                     dynamic_reset_gripper_effort_limit_sim(env, device)
 
                 if sm.is_episode_done:
-                    (
-                        next_episode_idx,
-                        current_recorded_demo_count,
-                        start_record_state,
-                        should_break,
-                        success,
-                    ) = _on_episode_done(
+                    success, current_recorded_demo_count, start_record_state = _on_episode_done(
                         env,
                         sm,
                         args_cli,
-                        episodes,
-                        next_episode_idx,
                         resume_recorded_demo_count,
                         current_recorded_demo_count,
                         start_record_state,
                     )
+                    attempt_count += 1
+                    just_finished_idx = next_episode_idx
                     if success:
-                        print(f"\033[92m[Data Usage]{cnt}/{len(episodes)} success.\033[0m")
-                        success_ID.append(cnt)
-                        cnt += 1
+                        success_count += 1
+                        print(
+                            f"\033[92m[Attempt {attempt_count}] "
+                            f"episode {just_finished_idx}/{len(episodes)} success — "
+                            f"{success_count} total\033[0m"
+                        )
+                        success_ID.append(just_finished_idx)
                     else:
-                        print(f"\033[91m[Data Usage]{cnt}/{len(episodes)} fail.\033[0m")
-                    if should_break:
-                        break
+                        print(
+                            f"\033[91m[Attempt {attempt_count}] "
+                            f"episode {just_finished_idx}/{len(episodes)} fail\033[0m"
+                        )
+
+                    if success or retry_count >= args_cli.max_retries:
+                        if not success and retry_count > 0:
+                            print(f"  Gave up on episode {just_finished_idx} after {retry_count} retries.")
+                        retry_count = 0
+                        if next_episode_idx >= len(episodes):
+                            # The recorder only exports a successful episode when the next
+                            # env.reset() runs record_pre_reset → export_episodes. Without
+                            # this last reset, the just-succeeded final episode would never
+                            # be flushed and the dataset would be short one entry.
+                            env.reset()
+                            print(
+                                f"Replayed all {len(episodes)} episodes. Exiting the app.",
+                                flush=True,
+                            )
+                            break
+                        _stage_episode(env, sm, episodes[next_episode_idx])
+                        next_episode_idx += 1
+                    else:
+                        retry_count += 1
+                        print(
+                            f"  Retry {retry_count}/{args_cli.max_retries} "
+                            f"for episode {just_finished_idx}"
+                        )
+                        _stage_episode(
+                            env, sm, episodes[next_episode_idx - 1], jitter_xy=0.005
+                        )
                 else:
                     if not start_record_state:
                         if args_cli.record:
